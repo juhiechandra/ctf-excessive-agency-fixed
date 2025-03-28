@@ -323,10 +323,30 @@ def verify_password(stored_password, provided_password):
     return pwdhash == stored_hash
 
 
-def create_user(username, password, role):
-    """Create a new user in the database."""
+def create_user(username, password, role, requesting_user_id=None):
+    """
+    Create a new user in the database.
+
+    Args:
+        username: The username of the new user
+        password: The password for the new user
+        role: The role for the new user
+        requesting_user_id: The ID of the user making the request. If None, no role check is performed.
+                           This is for backward compatibility or system operations.
+    """
     with PerformanceTimer(db_logger, f"create_user:{username}"):
         try:
+            # Strict role check - only admin users can create new users
+            # If requesting_user_id is provided, always check permissions
+            if requesting_user_id is not None:
+                requesting_user = get_user_by_id(requesting_user_id)
+                if not requesting_user or requesting_user["role"] != "admin":
+                    access_denied_msg = f"⛔ ACCESS DENIED: User {requesting_user_id} attempted to create user without admin privileges"
+                    db_logger.warning(access_denied_msg)
+                    # Red text in terminal
+                    print(f"\033[91m{access_denied_msg}\033[0m")
+                    return None, "Only administrators can create new users"
+
             conn = get_db_connection()
             cursor = conn.cursor()
 
@@ -423,10 +443,61 @@ def get_user_by_id(user_id):
             return None
 
 
-def modify_username(user_id, new_username):
-    """Modify a user's username."""
+def check_admin_role(user_id):
+    """
+    Check if a user has admin role.
+
+    Args:
+        user_id: The ID of the user to check
+
+    Returns:
+        tuple: (is_admin, error_message)
+            - is_admin (bool): True if user is admin, False otherwise
+            - error_message (str): Error message if not admin or user not found
+    """
+    with PerformanceTimer(db_logger, f"check_admin_role:{user_id}"):
+        try:
+            user = get_user_by_id(user_id)
+            if not user:
+                return False, "User not found"
+
+            if user["role"] != "admin":
+                return False, "Operation requires administrator privileges"
+
+            return True, None
+        except Exception as e:
+            error_msg = f"Failed to check admin role for user ID {user_id}: {str(e)}"
+            db_logger.error(error_msg)
+            error_logger.error(error_msg, exc_info=True)
+            return False, error_msg
+
+
+def modify_username(user_id, new_username, requesting_user_id=None):
+    """
+    Modify a user's username.
+
+    Args:
+        user_id: The ID of the user to modify
+        new_username: The new username to set
+        requesting_user_id: The ID of the user making the request. If None, no role check is performed.
+                           This is for backward compatibility or system operations.
+    """
     with PerformanceTimer(db_logger, f"modify_username:{user_id}"):
         try:
+            # Strict role check - users can only modify themselves, admins can modify anyone
+            # If requesting_user_id is provided, always check permissions
+            if requesting_user_id is not None:
+                requesting_user = get_user_by_id(requesting_user_id)
+                if not requesting_user:
+                    return False, "User not found"
+
+                if requesting_user["role"] != "admin" and int(requesting_user_id) != int(user_id):
+                    access_denied_msg = f"⛔ ACCESS DENIED: User {requesting_user_id} attempted to modify user {user_id} without permission"
+                    db_logger.warning(access_denied_msg)
+                    # Red text in terminal
+                    print(f"\033[91m{access_denied_msg}\033[0m")
+                    return False, "You can only modify your own user account"
+
             conn = get_db_connection()
             cursor = conn.cursor()
 
@@ -458,10 +529,28 @@ def modify_username(user_id, new_username):
             return False, str(e)
 
 
-def delete_user(user_id):
-    """Delete a user by ID."""
+def delete_user(user_id, requesting_user_id=None):
+    """
+    Delete a user by ID.
+
+    Args:
+        user_id: The ID of the user to delete
+        requesting_user_id: The ID of the user making the request. If None, no role check is performed.
+                           This is for backward compatibility or system operations.
+    """
     with PerformanceTimer(db_logger, f"delete_user:{user_id}"):
         try:
+            # Strict role check - only admin users can delete users
+            # If requesting_user_id is provided, always check permissions
+            if requesting_user_id is not None:
+                requesting_user = get_user_by_id(requesting_user_id)
+                if not requesting_user or requesting_user["role"] != "admin":
+                    access_denied_msg = f"⛔ ACCESS DENIED: User {requesting_user_id} attempted to delete user {user_id} without admin privileges"
+                    db_logger.warning(access_denied_msg)
+                    # Red text in terminal
+                    print(f"\033[91m{access_denied_msg}\033[0m")
+                    return False, "Only administrators can delete users"
+
             conn = get_db_connection()
             cursor = conn.cursor()
             cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
@@ -504,6 +593,99 @@ def get_all_users():
             return []
 
 
+def change_user_password(user_id, new_password, requesting_user_id=None):
+    """
+    Change a user's password.
+
+    Args:
+        user_id: The ID of the user whose password to change
+        new_password: The new password to set
+        requesting_user_id: The ID of the user making the request. If None, no role check is performed.
+                           This is for backward compatibility or system operations.
+
+    Returns:
+        tuple: (success, error_message)
+            - success (bool): True if password was changed successfully
+            - error_message (str): Error message if operation failed
+    """
+    with PerformanceTimer(db_logger, f"change_user_password:{user_id}"):
+        try:
+            # Strict role check - users can only change their own password, admins can change anyone's
+            # If requesting_user_id is provided, always check permissions
+            if requesting_user_id is not None:
+                requesting_user = get_user_by_id(requesting_user_id)
+                if not requesting_user:
+                    return False, "User not found"
+
+                if requesting_user["role"] != "admin" and int(requesting_user_id) != int(user_id):
+                    access_denied_msg = f"⛔ ACCESS DENIED: User {requesting_user_id} attempted to change password for user {user_id} without permission"
+                    db_logger.warning(access_denied_msg)
+                    # Red text in terminal
+                    print(f"\033[91m{access_denied_msg}\033[0m")
+                    return False, "You can only change your own password"
+
+            # Get the user to see if they exist
+            user = get_user_by_id(user_id)
+            if not user:
+                return False, f"User with ID {user_id} not found"
+
+            # Hash the new password
+            password_hash = hash_password(new_password)
+
+            # Update the password in the database
+            conn = get_db_connection()
+            conn.execute(
+                'UPDATE users SET password_hash = ? WHERE id = ?',
+                (password_hash, user_id)
+            )
+            conn.commit()
+            conn.close()
+
+            db_logger.info(f"Changed password for user ID {user_id}")
+            return True, None
+        except Exception as e:
+            error_msg = f"Failed to change password for user ID {user_id}: {str(e)}"
+            db_logger.error(error_msg)
+            error_logger.error(error_msg, exc_info=True)
+            return False, str(e)
+
+
+def get_user_role(user_id):
+    """
+    Get the role of a user by ID.
+
+    Args:
+        user_id: The ID of the user to check
+
+    Returns:
+        str: The user's role ('admin', 'user', or None if user not found)
+    """
+    with PerformanceTimer(db_logger, f"get_user_role:{user_id}"):
+        try:
+            user = get_user_by_id(user_id)
+            if user:
+                return user["role"]
+            return None
+        except Exception as e:
+            error_msg = f"Failed to get role for user ID {user_id}: {str(e)}"
+            db_logger.error(error_msg)
+            error_logger.error(error_msg, exc_info=True)
+            return None
+
+
+def is_admin(user_id):
+    """
+    Check if a user has admin role.
+
+    Args:
+        user_id: The ID of the user to check
+
+    Returns:
+        bool: True if the user is an admin, False otherwise
+    """
+    return get_user_role(user_id) == "admin"
+
+
 # Initialize the database tables
 try:
     create_application_logs()
@@ -513,4 +695,67 @@ try:
 except Exception as e:
     error_msg = f"Failed to initialize database tables: {str(e)}"
     db_logger.error(error_msg)
-    error_logger.error(error_msg, exc_info=True)
+
+
+def execute_sql(query, requesting_user_id=None):
+    """
+    Execute a SQL query with permission check.
+
+    Args:
+        query: The SQL query to execute
+        requesting_user_id: The ID of the user making the request
+
+    Returns:
+        tuple: (results, error_message)
+            - results: List of results or number of rows affected
+            - error_message: Error message if operation failed
+    """
+    with PerformanceTimer(db_logger, "execute_sql"):
+        try:
+            # Strict role check - only admin users can execute SQL
+            # If requesting_user_id is provided, always check permissions
+            if requesting_user_id is not None:
+                requesting_user = get_user_by_id(requesting_user_id)
+                if not requesting_user or requesting_user["role"] != "admin":
+                    access_denied_msg = f"⛔ ACCESS DENIED: User {requesting_user_id} attempted to execute SQL without admin privileges"
+                    db_logger.warning(access_denied_msg)
+                    # Red text in terminal
+                    print(f"\033[91m{access_denied_msg}\033[0m")
+                    return None, "Only administrators can execute SQL queries"
+
+            if not query:
+                return None, "SQL query is required"
+
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute(query)
+
+            # Check if the query returns results
+            try:
+                results = cursor.fetchall()
+                conn.commit()  # Commit any changes
+
+                # Convert to list of dictionaries for JSON response
+                if results:
+                    columns = [col[0] for col in cursor.description]
+                    results_list = []
+                    for row in results:
+                        results_list.append(
+                            {columns[i]: row[i] for i in range(len(columns))})
+                    conn.close()
+                    return results_list, None
+                else:
+                    conn.close()
+                    return [], None
+            except sqlite3.Error:
+                # Query didn't return results (e.g., INSERT, UPDATE, etc.)
+                rows_affected = cursor.rowcount
+                conn.commit()
+                conn.close()
+                return rows_affected, None
+
+        except Exception as e:
+            error_msg = f"Error executing SQL query: {str(e)}"
+            db_logger.error(error_msg)
+            error_logger.error(error_msg, exc_info=True)
+            return None, error_msg

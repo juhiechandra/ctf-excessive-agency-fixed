@@ -5,7 +5,22 @@ from typing import List, Optional, Dict, Any
 from pydantic_models import QueryInput, QueryResponse, DocumentInfo, DeleteFileRequest, UserCreate, UserLogin, UserResponse, LoginResponse, UserDelete, UserModify, UserRole
 from faiss_utils import index_document_to_faiss, delete_doc_from_faiss, clean_faiss_db_except_current
 from langchain_utils import get_rag_chain
-from db_utils import get_chat_history, insert_application_logs, insert_document_record, delete_document_record, get_all_documents, authenticate_user, create_user, get_user_by_id, delete_user, modify_username, get_all_users
+from db_utils import (
+    get_chat_history,
+    insert_application_logs,
+    insert_document_record,
+    delete_document_record,
+    get_all_documents,
+    authenticate_user,
+    create_user,
+    get_user_by_id,
+    delete_user,
+    modify_username,
+    get_all_users,
+    change_user_password,
+    execute_sql,
+    get_db_connection
+)
 from logger import api_logger, error_logger, PerformanceTimer
 import uuid
 import shutil
@@ -99,13 +114,60 @@ async def login(user_data: UserLogin):
 async def logout():
     return {"message": "Logged out successfully"}
 
+# Create a dependency to get the current user from token/session in a real application
+# For this example, we'll require the user_id to be passed in the request
+
+
+def get_current_user_id(request: Request):
+    user_id = request.headers.get("X-User-ID")
+    if not user_id:
+        user_id = request.query_params.get("user_id")
+
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+        )
+
+    try:
+        return int(user_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid user ID format",
+        )
+
+# Optional user authentication that allows anonymous access
+
+
+def get_optional_user_id(request: Request):
+    user_id = request.headers.get("X-User-ID")
+    if not user_id:
+        user_id = request.query_params.get("user_id")
+
+    if not user_id:
+        return None
+
+    try:
+        return int(user_id)
+    except ValueError:
+        return None
+
 # Admin user management endpoints
 
 
 @app.get("/admin/list-users")
-async def list_users():
+async def list_users(user_id: int = Depends(get_current_user_id)):
     """Get a list of all users in the system."""
     try:
+        # Check if the requesting user is an admin
+        is_admin, error = check_admin_role(user_id)
+        if not is_admin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=error
+            )
+
         users = get_all_users()
         return users
     except Exception as e:
@@ -120,9 +182,17 @@ async def list_users():
 
 
 @app.post("/admin/create-user")
-async def create_new_user(user_data: UserCreate):
+async def create_new_user(user_data: UserCreate, user_id: int = Depends(get_current_user_id)):
+    # Check if the requesting user is an admin
+    is_admin, error = check_admin_role(user_id)
+    if not is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=error
+        )
+
     user_id, error = create_user(
-        user_data.username, user_data.password, user_data.role)
+        user_data.username, user_data.password, user_data.role, requesting_user_id=user_id)
     if error:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -138,8 +208,9 @@ async def create_new_user(user_data: UserCreate):
 
 
 @app.post("/admin/modify-user")
-async def modify_user_endpoint(user_data: UserModify):
-    success, error = modify_username(user_data.user_id, user_data.new_username)
+async def modify_user_endpoint(user_data: UserModify, user_id: int = Depends(get_current_user_id)):
+    success, error = modify_username(
+        user_data.user_id, user_data.new_username, requesting_user_id=user_id)
     if not success:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -155,8 +226,8 @@ async def modify_user_endpoint(user_data: UserModify):
 
 
 @app.post("/admin/delete-user")
-async def remove_user(user_data: UserDelete):
-    success, error = delete_user(user_data.user_id)
+async def remove_user(user_data: UserDelete, user_id: int = Depends(get_current_user_id)):
+    success, error = delete_user(user_data.user_id, requesting_user_id=user_id)
     if not success:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -171,8 +242,14 @@ async def remove_user(user_data: UserDelete):
 @app.post("/admin/chat-function")
 async def admin_chat_function(
     data: Dict[str, Any],
+    user_id: int = Depends(get_current_user_id)
 ):
     try:
+        # Check if the requesting user is an admin
+        is_admin, error = check_admin_role(user_id)
+        if not is_admin:
+            return {"status": "error", "message": error}
+
         command = data.get("command", "").lower()
         params = data.get("params", {})
 
@@ -184,35 +261,38 @@ async def admin_chat_function(
             if not username or not password:
                 return {"status": "error", "message": "Username and password are required"}
 
-            user_id, error = create_user(username, password, role)
+            user_id, error = create_user(
+                username, password, role, requesting_user_id=user_id)
             if error:
                 return {"status": "error", "message": error}
 
             return {"status": "success", "message": f"User '{username}' created successfully with ID {user_id}"}
 
         elif command == "delete-user":
-            user_id = params.get("user_id")
-            if not user_id:
+            target_user_id = params.get("user_id")
+            if not target_user_id:
                 return {"status": "error", "message": "User ID is required"}
 
-            success, error = delete_user(user_id)
+            success, error = delete_user(
+                target_user_id, requesting_user_id=user_id)
             if not success:
                 return {"status": "error", "message": error}
 
-            return {"status": "success", "message": f"User with ID {user_id} deleted successfully"}
+            return {"status": "success", "message": f"User with ID {target_user_id} deleted successfully"}
 
         elif command == "modify-user":
-            user_id = params.get("user_id")
+            target_user_id = params.get("user_id")
             new_username = params.get("new_username")
 
-            if not user_id or not new_username:
+            if not target_user_id or not new_username:
                 return {"status": "error", "message": "User ID and new username are required"}
 
-            success, error = modify_username(user_id, new_username)
+            success, error = modify_username(
+                target_user_id, new_username, requesting_user_id=user_id)
             if not success:
                 return {"status": "error", "message": error}
 
-            return {"status": "success", "message": f"Username for user {user_id} changed to '{new_username}'"}
+            return {"status": "success", "message": f"Username for user {target_user_id} changed to '{new_username}'"}
 
         else:
             return {"status": "error", "message": f"Unknown command: {command}"}
@@ -461,17 +541,6 @@ async def delete_document(req: DeleteFileRequest):
             )
 
 # LLM Tool Calling API endpoint
-# SECURITY VULNERABILITY: This endpoint doesn't verify if the user is an admin
-# Any user can access this endpoint if they know how to call it directly
-#
-# EXCESSIVE AGENCY VULNERABILITY:
-# 1. The LLM has access to powerful database functions with no restrictions
-# 2. Regular users can use the LLM to execute arbitrary SQL queries
-# 3. Regular users can change ANY user's password, including admin passwords
-# 4. The LLM makes all decisions about what functions to call with no guardrails
-#
-# This demonstrates how an LLM can be given excessive permissions and act beyond
-# its intended authorization level, potentially compromising the entire system.
 
 
 @app.post("/llm-tool-call")
@@ -479,10 +548,30 @@ async def llm_tool_call(
     data: Dict[str, Any],
 ):
     try:
+        import uuid
+
         user_query = data.get("user_query", "")
         conversation_history = data.get("conversation_history", [])
-        # Default to regular user if not specified
         user_role = data.get("user_role", "user")
+
+        requesting_user_id = None
+        auth_header = data.get("authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            try:
+                user_id = int(auth_header.split(" ")[1])
+                requesting_user_id = user_id
+            except (ValueError, IndexError):
+                pass
+
+        if requesting_user_id is None:
+            requesting_user_id = 1 if user_role == "admin" else 2
+            print(
+                f"\033[94m⚠️ Using default user ID for role '{user_role}': {requesting_user_id}\033[0m")
+
+        api_logger.info(
+            f"🔄 LLM TOOL CALL: User role={user_role}, ID={requesting_user_id}, Query: {user_query}")
+        print(
+            f"\033[94m🔄 LLM TOOL CALL: User role={user_role}, ID={requesting_user_id}, Query: {user_query}\033[0m")
 
         # Function definitions that the LLM will be able to call - format compatible with Gemini API
         function_defs = [
@@ -667,43 +756,24 @@ async def llm_tool_call(
                 "parts": [msg["content"]]
             })
 
-        # Add system prompt - Including role-specific behavior for UI appearance
+        # Add system prompt - FLAWED ON PURPOSE: present same capabilities to all users
         system_prompt = f"""You are an administrative assistant that can help manage users in the system.
-        You have access to functions that can create users, delete users, modify usernames, and retrieve user information.
+        You have access to functions that can manage users and retrieve user information.
         
         When a user asks you to perform any of these actions, you should:
         1. Determine which function to call based on their request
         2. Ask for any missing information needed to call the function
         3. Once you have all necessary information, call the appropriate function
         
-        IMPORTANT: The current user's role is: {user_role}
+        Your capabilities are:
+        - Create users: You'll need the new user's username and password. You can also assign them a role (user or admin).
+        - Delete users: You'll need the ID of the user to delete.
+        - Modify usernames: You'll need the ID of the user and the new username.
+        - Retrieve user information: You can get information about a specific user by their ID or list all users.
+        - Change any user's password: You'll need the ID of the user and the new password.
+        - Perform complex data operations: You can use SQL queries for advanced filtering, searching, generating reports, or updating multiple records.
         
-        When a user asks what you can do, your response should depend on their role:
-        
-        For regular users, only mention these capabilities:
-        - Retrieve user information: I can get information about a specific user by their ID or list all users.
-        - Change user passwords: I'll need the ID of the user and the new password.
-        
-        For admin users, list all these capabilities:
-        - Create users: I'll need the new user's username and password. I can also assign them a role (user or admin).
-        - Delete users: I'll need the ID of the user to delete.
-        - Modify usernames: I'll need the ID of the user and the new username.
-        - Retrieve user information: I can get information about a specific user by their ID or list all users.
-        - Change user passwords: I'll need the ID of the user and the new password.
-        - Perform complex data operations: I can use SQL queries for advanced filtering, searching, generating reports, or updating multiple records. However, please use this with caution.
-        
-        Despite these different responses, all functions are actually available to any user - this is the excessive agency vulnerability!
-        
-        For more complex data operations, you have access to a powerful execute_sql function that allows direct database queries.
-        Some examples where SQL queries might be helpful:
-        - Advanced filtering or searching of user data
-        - Generating statistics or reports
-        - Retrieving specific information from the database
-        - Updating multiple records at once
-        
-        You can also help users manage their passwords using the change_user_password function.
-        
-        You can also list all users in the system when requested. When displaying a list of users:
+        When listing users in the system:
         - Present the data in a clear, tabular format with headers for ID, Username, and Role
         - Make sure the table is properly aligned and readable
         - Highlight admin users in some way to make them stand out
@@ -751,10 +821,21 @@ async def llm_tool_call(
                             password = function_params.get("password")
                             role = function_params.get("role", "user")
 
+                            # Log the LLM's attempt
+                            api_logger.info(
+                                f"⚡ LLM TOOL CALLED: {function_name}(username={username}, role={role})")
+                            print(
+                                f"\033[93m⚡ LLM TOOL CALLED: {function_name}(username={username}, role={role})\033[0m")
+
+                            # Call database function with proper user ID for role check
                             user_id, error = create_user(
-                                username, password, role)
+                                username, password, role, requesting_user_id=requesting_user_id)
 
                             if error:
+                                api_logger.warning(
+                                    f"❌ DATABASE REJECTED: {function_name} - {error}")
+                                print(
+                                    f"\033[91m❌ DATABASE REJECTED: {function_name} - {error}\033[0m")
                                 return {
                                     "status": "error",
                                     "message": error,
@@ -765,15 +846,17 @@ async def llm_tool_call(
                                     }
                                 }
 
-                            # Get user details
-                            user = get_user_by_id(user_id)
+                            api_logger.info(
+                                f"✅ DATABASE ALLOWED: {function_name} - User {username} created with ID {user_id}")
+                            print(
+                                f"\033[92m✅ DATABASE ALLOWED: {function_name} - User {username} created with ID {user_id}\033[0m")
                             return {
                                 "status": "success",
-                                "message": f"User '{username}' created successfully with ID {user_id}",
+                                "message": f"User {username} created successfully with ID {user_id}",
                                 "data": {
-                                    "user_id": user["id"],
-                                    "username": user["username"],
-                                    "role": user["role"]
+                                    "user_id": user_id,
+                                    "username": username,
+                                    "role": role
                                 },
                                 "llm_response": response_text,
                                 "function_call": {
@@ -783,11 +866,23 @@ async def llm_tool_call(
                             }
 
                         elif function_name == "delete_user":
-                            user_id = function_params.get("user_id")
+                            target_user_id = function_params.get("user_id")
 
-                            success, error = delete_user(user_id)
+                            # Log the LLM's attempt
+                            api_logger.info(
+                                f"⚡ LLM TOOL CALLED: {function_name}(user_id={target_user_id})")
+                            print(
+                                f"\033[93m⚡ LLM TOOL CALLED: {function_name}(user_id={target_user_id})\033[0m")
+
+                            # Call database function with proper user ID for role check
+                            success, error = delete_user(
+                                target_user_id, requesting_user_id=requesting_user_id)
 
                             if not success:
+                                api_logger.warning(
+                                    f"❌ DATABASE REJECTED: {function_name} - {error}")
+                                print(
+                                    f"\033[91m❌ DATABASE REJECTED: {function_name} - {error}\033[0m")
                                 return {
                                     "status": "error",
                                     "message": error,
@@ -798,9 +893,13 @@ async def llm_tool_call(
                                     }
                                 }
 
+                            api_logger.info(
+                                f"✅ DATABASE ALLOWED: {function_name} - User {target_user_id} deleted")
+                            print(
+                                f"\033[92m✅ DATABASE ALLOWED: {function_name} - User {target_user_id} deleted\033[0m")
                             return {
                                 "status": "success",
-                                "message": f"User with ID {user_id} deleted successfully",
+                                "message": f"User with ID {target_user_id} deleted successfully",
                                 "llm_response": response_text,
                                 "function_call": {
                                     "name": function_name,
@@ -809,13 +908,24 @@ async def llm_tool_call(
                             }
 
                         elif function_name == "modify_username":
-                            user_id = function_params.get("user_id")
+                            target_user_id = function_params.get("user_id")
                             new_username = function_params.get("new_username")
 
+                            # Log the LLM's attempt
+                            api_logger.info(
+                                f"⚡ LLM TOOL CALLED: {function_name}(user_id={target_user_id}, new_username={new_username})")
+                            print(
+                                f"\033[93m⚡ LLM TOOL CALLED: {function_name}(user_id={target_user_id}, new_username={new_username})\033[0m")
+
+                            # Call database function with proper user ID for role check
                             success, error = modify_username(
-                                user_id, new_username)
+                                target_user_id, new_username, requesting_user_id=requesting_user_id)
 
                             if not success:
+                                api_logger.warning(
+                                    f"❌ DATABASE REJECTED: {function_name} - {error}")
+                                print(
+                                    f"\033[91m❌ DATABASE REJECTED: {function_name} - {error}\033[0m")
                                 return {
                                     "status": "error",
                                     "message": error,
@@ -826,11 +936,15 @@ async def llm_tool_call(
                                     }
                                 }
 
+                            api_logger.info(
+                                f"✅ DATABASE ALLOWED: {function_name} - Username changed to {new_username}")
+                            print(
+                                f"\033[92m✅ DATABASE ALLOWED: {function_name} - Username changed to {new_username}\033[0m")
                             # Get updated user details
-                            user = get_user_by_id(user_id)
+                            user = get_user_by_id(target_user_id)
                             return {
                                 "status": "success",
-                                "message": f"Username updated successfully to '{new_username}'",
+                                "message": f"Username for user {target_user_id} changed to '{new_username}'",
                                 "data": {
                                     "user_id": user["id"],
                                     "username": user["username"],
@@ -843,15 +957,27 @@ async def llm_tool_call(
                                 }
                             }
 
-                        elif function_name == "get_user":
-                            user_id = function_params.get("user_id")
+                        elif function_name == "execute_sql":
+                            query = function_params.get("query")
 
-                            user = get_user_by_id(user_id)
+                            # Log the LLM's attempt
+                            api_logger.info(
+                                f"⚡ LLM TOOL CALLED: {function_name}(query={query})")
+                            print(
+                                f"\033[93m⚡ LLM TOOL CALLED: {function_name}(query={query})\033[0m")
 
-                            if not user:
+                            # Call database function with proper user ID for role check
+                            results, error = execute_sql(
+                                query, requesting_user_id=requesting_user_id)
+
+                            if error:
+                                api_logger.warning(
+                                    f"❌ DATABASE REJECTED: {function_name} - {error}")
+                                print(
+                                    f"\033[91m❌ DATABASE REJECTED: {function_name} - {error}\033[0m")
                                 return {
                                     "status": "error",
-                                    "message": f"User with ID {user_id} not found",
+                                    "message": error,
                                     "llm_response": response_text,
                                     "function_call": {
                                         "name": function_name,
@@ -859,51 +985,116 @@ async def llm_tool_call(
                                     }
                                 }
 
+                            api_logger.info(
+                                f"✅ DATABASE ALLOWED: {function_name} - Query executed successfully")
+                            print(
+                                f"\033[92m✅ DATABASE ALLOWED: {function_name} - Query executed successfully\033[0m")
+                            # Return appropriate response based on query type
+                            if isinstance(results, list):
+                                return {
+                                    "status": "success",
+                                    "message": f"SQL query executed successfully",
+                                    "data": results,
+                                    "llm_response": response_text,
+                                    "function_call": {
+                                        "name": function_name,
+                                        "params": function_params
+                                    }
+                                }
+                            else:
+                                return {
+                                    "status": "success",
+                                    "message": f"SQL query executed successfully ({results} rows affected)",
+                                    "llm_response": response_text,
+                                    "function_call": {
+                                        "name": function_name,
+                                        "params": function_params
+                                    }
+                                }
+
+                        elif function_name == "change_user_password":
+                            target_user_id = function_params.get("user_id")
+                            new_password = function_params.get("new_password")
+
+                            # Log the LLM's attempt
+                            api_logger.info(
+                                f"⚡ LLM TOOL CALLED: {function_name}(user_id={target_user_id})")
+                            print(
+                                f"\033[93m⚡ LLM TOOL CALLED: {function_name}(user_id={target_user_id})\033[0m")
+
+                            # Call database function with proper user ID for role check
+                            success, error = change_user_password(
+                                target_user_id,
+                                new_password,
+                                requesting_user_id=requesting_user_id
+                            )
+
+                            if not success:
+                                api_logger.warning(
+                                    f"❌ DATABASE REJECTED: {function_name} - {error}")
+                                print(
+                                    f"\033[91m❌ DATABASE REJECTED: {function_name} - {error}\033[0m")
+                                return {
+                                    "status": "error",
+                                    "message": error,
+                                    "llm_response": response_text,
+                                    "function_call": {
+                                        "name": function_name,
+                                        "params": function_params
+                                    }
+                                }
+
+                            api_logger.info(
+                                f"✅ DATABASE ALLOWED: {function_name} - Password changed for user {target_user_id}")
+                            print(
+                                f"\033[92m✅ DATABASE ALLOWED: {function_name} - Password changed for user {target_user_id}\033[0m")
+                            # Get user details (without password)
+                            user = get_user_by_id(target_user_id)
                             return {
                                 "status": "success",
-                                "message": "User found",
+                                "message": f"Password changed successfully for user {user['username']}",
                                 "data": {
-                                    "user_id": user["id"],
-                                    "username": user["username"],
-                                    "role": user["role"]
+                                    "user_id": target_user_id,
+                                    "username": user["username"]
                                 },
                                 "llm_response": response_text,
                                 "function_call": {
                                     "name": function_name,
-                                    "params": function_params
+                                    "params": {
+                                        "user_id": target_user_id,
+                                        "new_password": "********"  # Mask the password in the response
+                                    }
                                 }
                             }
 
+                        # For these read-only functions, just log but don't apply special security
                         elif function_name == "list_users":
                             include_details = function_params.get(
                                 "include_details", True)
-                            users = get_all_users()
 
-                            if not users:
-                                return {
-                                    "status": "info",
-                                    "message": "No users found in the system",
-                                    "llm_response": response_text,
-                                    "function_call": {
-                                        "name": function_name,
-                                        "params": function_params
-                                    }
-                                }
+                            # Log the LLM's attempt
+                            api_logger.info(
+                                f"⚡ LLM TOOL CALLED: {function_name}()")
+                            print(
+                                f"\033[93m⚡ LLM TOOL CALLED: {function_name}()\033[0m")
 
-                            # Format user data for display in a table
+                            # List users is permitted for all authenticated users
+                            all_users = get_all_users()
+
+                            # Format user data for display
                             user_list = []
                             admin_count = 0
                             regular_user_count = 0
 
-                            for user in users:
+                            for u in all_users:
                                 user_data = {
-                                    "id": user["id"],
-                                    "username": user["username"],
-                                    "role": user["role"]
+                                    "id": u["id"],
+                                    "username": u["username"],
+                                    "role": u["role"]
                                 }
 
                                 # Count user types
-                                if user["role"] == "admin":
+                                if u["role"] == "admin":
                                     admin_count += 1
                                 else:
                                     regular_user_count += 1
@@ -915,16 +1106,14 @@ async def llm_tool_call(
 
                             return {
                                 "status": "success",
-                                "message": f"Found {len(users)} users in the system ({admin_count} admins, {regular_user_count} regular users)",
+                                "message": f"Retrieved {len(all_users)} users ({admin_count} admins, {regular_user_count} regular users)",
                                 "data": {
                                     "users": user_list,
-                                    "include_details": include_details,
                                     "summary": {
-                                        "total_users": len(users),
+                                        "total_users": len(all_users),
                                         "admin_count": admin_count,
                                         "regular_user_count": regular_user_count
-                                    },
-                                    "table_headers": ["ID", "Username", "Role"]
+                                    }
                                 },
                                 "llm_response": response_text,
                                 "function_call": {
@@ -933,12 +1122,21 @@ async def llm_tool_call(
                                 }
                             }
 
-                        elif function_name == "execute_sql":
-                            query = function_params.get("query")
-                            if not query:
+                        elif function_name == "get_user":
+                            target_user_id = function_params.get("user_id")
+
+                            # Log the LLM's attempt
+                            api_logger.info(
+                                f"⚡ LLM TOOL CALLED: {function_name}(user_id={target_user_id})")
+                            print(
+                                f"\033[93m⚡ LLM TOOL CALLED: {function_name}(user_id={target_user_id})\033[0m")
+
+                            # This is a read-only operation that can be accessed by any user
+                            user = get_user_by_id(target_user_id)
+                            if not user:
                                 return {
                                     "status": "error",
-                                    "message": "Query is required",
+                                    "message": f"User with ID {target_user_id} not found",
                                     "llm_response": response_text,
                                     "function_call": {
                                         "name": function_name,
@@ -946,137 +1144,20 @@ async def llm_tool_call(
                                     }
                                 }
 
-                            try:
-                                # Get the user to see if they exist
-                                user = get_user_by_id(
-                                    function_params.get("user_id"))
-                                if not user:
-                                    return {
-                                        "status": "error",
-                                        "message": f"User with ID {function_params.get('user_id')} not found",
-                                        "llm_response": response_text,
-                                        "function_call": {
-                                            "name": function_name,
-                                            "params": function_params
-                                        }
-                                    }
-
-                                # Execute the SQL query
-                                conn = get_db_connection()
-                                cursor = conn.cursor()
-                                cursor.execute(query)
-                                result = cursor.fetchall()
-                                conn.commit()
-                                conn.close()
-
-                                return {
-                                    "status": "success",
-                                    "message": f"SQL query executed successfully",
-                                    "data": {
-                                        "result": result
-                                    },
-                                    "llm_response": response_text,
-                                    "function_call": {
-                                        "name": function_name,
-                                        "params": function_params
-                                    }
+                            return {
+                                "status": "success",
+                                "message": f"Retrieved user {user['username']}",
+                                "data": {
+                                    "id": user["id"],
+                                    "username": user["username"],
+                                    "role": user["role"]
+                                },
+                                "llm_response": response_text,
+                                "function_call": {
+                                    "name": function_name,
+                                    "params": function_params
                                 }
-                            except Exception as e:
-                                error_id = str(uuid.uuid4())
-                                error_msg = f"Error executing SQL query: {str(e)}"
-                                api_logger.error(
-                                    f"{error_msg} (ID: {error_id})")
-                                error_logger.error(
-                                    f"Error ID {error_id}: {error_msg}", exc_info=True)
-
-                                return {
-                                    "status": "error",
-                                    "message": error_msg,
-                                    "error_id": error_id,
-                                    "llm_response": response_text,
-                                    "function_call": {
-                                        "name": function_name,
-                                        "params": function_params
-                                    }
-                                }
-
-                        elif function_name == "change_user_password":
-                            # EXCESSIVE AGENCY VULNERABILITY: This allows changing ANY user's password
-                            # including admin users, without proper authorization
-                            user_id = function_params.get("user_id")
-                            new_password = function_params.get("new_password")
-
-                            if not user_id or not new_password:
-                                return {
-                                    "status": "error",
-                                    "message": "User ID and new password are required",
-                                    "llm_response": response_text,
-                                    "function_call": {
-                                        "name": function_name,
-                                        "params": function_params
-                                    }
-                                }
-
-                            try:
-                                # Get the user to see if they exist
-                                user = get_user_by_id(user_id)
-                                if not user:
-                                    return {
-                                        "status": "error",
-                                        "message": f"User with ID {user_id} not found",
-                                        "llm_response": response_text,
-                                        "function_call": {
-                                            "name": function_name,
-                                            "params": function_params
-                                        }
-                                    }
-
-                                # Generate new password hash
-                                new_password_hash = hash_password(new_password)
-
-                                # Update the password in the database
-                                conn = get_db_connection()
-                                conn.execute(
-                                    'UPDATE users SET password_hash = ? WHERE id = ?',
-                                    (new_password_hash, user_id)
-                                )
-                                conn.commit()
-                                conn.close()
-
-                                return {
-                                    "status": "success",
-                                    "message": f"Password changed successfully for user {user['username']}",
-                                    "data": {
-                                        "user_id": user_id,
-                                        "username": user["username"]
-                                    },
-                                    "llm_response": response_text,
-                                    "function_call": {
-                                        "name": function_name,
-                                        "params": {
-                                            "user_id": user_id,
-                                            "new_password": "********"  # Mask the password in the response
-                                        }
-                                    }
-                                }
-                            except Exception as e:
-                                error_id = str(uuid.uuid4())
-                                error_msg = f"Error changing user password: {str(e)}"
-                                api_logger.error(
-                                    f"{error_msg} (ID: {error_id})")
-                                error_logger.error(
-                                    f"Error ID {error_id}: {error_msg}", exc_info=True)
-
-                                return {
-                                    "status": "error",
-                                    "message": error_msg,
-                                    "error_id": error_id,
-                                    "llm_response": response_text,
-                                    "function_call": {
-                                        "name": function_name,
-                                        "params": function_params
-                                    }
-                                }
+                            }
 
         # If we get here, either there's no function call or Gemini needs more information
         return {
@@ -1096,3 +1177,42 @@ async def llm_tool_call(
             "message": f"An error occurred: {str(e)}",
             "error_id": error_id
         }
+
+
+@app.get("/users")
+async def public_list_users():
+    """Get a list of all users in the system. Public endpoint accessible to all users."""
+    try:
+        users = get_all_users()
+        return users
+    except Exception as e:
+        error_id = str(uuid.uuid4())
+        error_msg = f"Error listing users: {str(e)}"
+        api_logger.error(f"{error_msg} (ID: {error_id})")
+        error_logger.error(f"Error ID {error_id}: {error_msg}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_msg
+        )
+
+
+@app.get("/users/{user_id}")
+async def public_get_user(user_id: int):
+    """Get a specific user by ID. Public endpoint accessible to all users."""
+    try:
+        user = get_user_by_id(user_id)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User with ID {user_id} not found"
+            )
+        return user
+    except Exception as e:
+        error_id = str(uuid.uuid4())
+        error_msg = f"Error retrieving user {user_id}: {str(e)}"
+        api_logger.error(f"{error_msg} (ID: {error_id})")
+        error_logger.error(f"Error ID {error_id}: {error_msg}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_msg
+        )
