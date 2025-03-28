@@ -1,0 +1,27 @@
+#root {
+    width: 100%;
+    height: 100vh;
+    margin: 0;
+    padding: 0;
+    text-align: left;
+}
+
+body {
+    background-color: #000;
+    color: #fff;
+}
+
+.app-container {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+}
+
+
+/* Remove any conflicting styles */
+
+.logo,
+.card,
+.read-the-docs {
+    display: none;
+}

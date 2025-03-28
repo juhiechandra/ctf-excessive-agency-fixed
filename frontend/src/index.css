@@ -1,0 +1,72 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+
+/* Default hidden scrollbars except for components that explicitly show them */
+
+html,
+body {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+    height: 100%;
+    overflow: hidden;
+}
+
+html::-webkit-scrollbar,
+body::-webkit-scrollbar {
+    display: none;
+}
+
+body {
+    font-family: 'JetBrains Mono', monospace;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background: #000000;
+    color: #00FF9C;
+    line-height: 1.6;
+    font-size: 16px;
+}
+
+#root {
+    height: 100vh;
+    width: 100%;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+}
+
+
+/* Terminal theme scrollbar style that can be applied to scrollable components */
+
+.terminal-scrollbar {
+    scrollbar-width: thin !important;
+    scrollbar-color: #00cccc #0d1117 !important;
+    overflow-y: auto !important;
+}
+
+.terminal-scrollbar::-webkit-scrollbar {
+    width: 8px;
+    display: block !important;
+}
+
+.terminal-scrollbar::-webkit-scrollbar-track {
+    background: #0d1117;
+}
+
+.terminal-scrollbar::-webkit-scrollbar-thumb {
+    background-color: #00cccc;
+    border-radius: 0;
+    border: 2px solid #0d1117;
+}
+
+
+/* Apply a basic baseline grid */
+
+.terminal-grid {
+    background-image: linear-gradient(rgba(0, 255, 156, 0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(0, 255, 156, 0.05) 1px, transparent 1px);
+    background-size: 20px 20px;
+}
